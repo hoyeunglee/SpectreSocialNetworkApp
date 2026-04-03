@@ -1,0 +1,17 @@
+body {
+  font-family: sans-serif;
+  margin: 0;
+  padding: 16px;
+  background: #f5f5f5;
+}
+
+input, textarea {
+  width: 100%;
+  padding: 8px;
+  margin: 4px 0;
+}
+
+button {
+  padding: 8px 12px;
+  margin-top: 8px;
+}
