@@ -1,0 +1,181 @@
+// Assume: g is GraphTraversalSource connected to Neptune
+
+// ---------- Seed reference data ----------
+
+def ensureCountry = { code, region, policy ->
+  g.V().has('Country', 'country_code', code).
+    fold().
+    coalesce(unfold(),
+             addV('Country')
+               .property('country_code', code)
+               .property('region', region)
+               .property('data_residency_policy', policy)
+    ).next()
+}
+
+def ensureTag = { key, type ->
+  g.V().has('Tag', 'tag_key', key).
+    fold().
+    coalesce(unfold(),
+             addV('Tag')
+               .property('tag_key', key)
+               .property('tag_type', type)
+    ).next()
+}
+
+def us   = ensureCountry('US', 'NA',   'DATA_RESIDENCY_US')
+def de   = ensureCountry('DE', 'EU',   'DATA_RESIDENCY_EU_STRICT')
+def hk   = ensureCountry('HK', 'APAC', 'DATA_RESIDENCY_HK')
+
+def tagSports  = ensureTag('INTEREST:SPORTS', 'INTEREST')
+def tagTech    = ensureTag('INTEREST:TECH',   'INTEREST')
+def tagRiskHi  = ensureTag('RISK:HIGH',       'RISK')
+def tagPremium = ensureTag('SEGMENT:PREMIUM', 'SEGMENT')
+
+// ---------- Helper creators ----------
+
+def createUser = { userId, countryCode, kyc, risk, status ->
+  def now = System.currentTimeMillis()
+  def countryV = g.V().has('Country', 'country_code', countryCode).next()
+
+  def u = g.V().has('User', 'user_id', userId).
+    fold().
+    coalesce(unfold(),
+             addV('User')
+               .property('user_id', userId)
+               .property('country_code', countryCode)
+               .property('kyc_level', kyc)
+               .property('risk_score', risk)
+               .property('account_status', status)
+               .property('created_at', now)
+    ).next()
+
+  g.V(u).as('u').
+    coalesce(
+      outE('FROM_COUNTRY').where(inV().hasId(countryV.id())),
+      addE('FROM_COUNTRY').from('u').to(countryV)
+    ).iterate()
+
+  return u
+}
+
+def createDevice = { deviceId, platform, osVersion, flags ->
+  g.V().has('Device', 'device_id', deviceId).
+    fold().
+    coalesce(unfold(),
+             addV('Device')
+               .property('device_id', deviceId)
+               .property('platform', platform)
+               .property('os_version', osVersion)
+               .property('is_jailbroken', flags.get('is_jailbroken', false))
+               .property('is_rooted', flags.get('is_rooted', false))
+    ).next()
+}
+
+def createSession = { sessionId, ipHash, asn, connType, countryCode ->
+  def now = System.currentTimeMillis()
+  def s = g.V().has('Session', 'session_id', sessionId).
+    fold().
+    coalesce(unfold(),
+             addV('Session')
+               .property('session_id', sessionId)
+               .property('ip_hash', ipHash)
+               .property('asn', asn)
+               .property('connection_type', connType)
+               .property('created_at', now)
+    ).next()
+
+  def c = g.V().has('Country', 'country_code', countryCode).next()
+  g.addE('FROM_COUNTRY').from(s).to(c).iterate()
+  return s
+}
+
+def createContent = { contentId, type, visibility ->
+  g.V().has('Content', 'content_id', contentId).
+    fold().
+    coalesce(unfold(),
+             addV('Content')
+               .property('content_id', contentId)
+               .property('content_type', type)
+               .property('visibility', visibility)
+               .property('created_at', System.currentTimeMillis())
+    ).next()
+}
+
+// ---------- Sample data wiring ----------
+
+def u1 = createUser('u1', 'US', 'FULL',  10, 'ACTIVE')
+def u2 = createUser('u2', 'DE', 'BASIC', 30, 'ACTIVE')
+def u3 = createUser('u3', 'HK', 'NONE',  70, 'REVIEW')
+
+def d1 = createDevice('d1', 'IOS',     '17.4', [is_jailbroken:false])
+def d2 = createDevice('d2', 'ANDROID', '15',   [is_rooted:false])
+
+def s1 = createSession('s1', 'iphash1', 12345, 'MOBILE', 'US')
+def s2 = createSession('s2', 'iphash2', 54321, 'WIFI',   'DE')
+
+// Link users to devices and sessions
+g.addE('USES_DEVICE').from(u1).to(d1).
+  property('first_seen_at', System.currentTimeMillis()).
+  iterate()
+
+g.addE('USES_DEVICE').from(u2).to(d2).
+  property('first_seen_at', System.currentTimeMillis()).
+  iterate()
+
+g.addE('HAS_SESSION').from(u1).to(s1).iterate()
+g.addE('HAS_SESSION').from(u2).to(s2).iterate()
+
+// Social edges
+g.addE('FRIEND_OF').from(u1).to(u2).
+  property('since', System.currentTimeMillis()).
+  property('strength', 0.8).
+  iterate()
+
+g.addE('FOLLOWS').from(u3).to(u1).
+  property('since', System.currentTimeMillis()).
+  iterate()
+
+// Content and tags
+def c1 = createContent('c1', 'POST', 'PUBLIC')
+g.addE('CREATED').from(u1).to(c1).iterate()
+
+g.addE('TAGGED_WITH').from(u1).to(tagTech).iterate()
+g.addE('TAGGED_WITH').from(u3).to(tagRiskHi).iterate()
+g.addE('TAGGED_WITH').from(u1).to(tagPremium).iterate()
+
+
+// All users in Germany and their friends (within same country)
+g.V().has('Country', 'countryCode', 'DE').as('c').
+  in('FROM_COUNTRY').hasLabel('User').as('u').
+  both('FRIEND_OF').as('f').
+  select('u','f').
+  by('userId')
+
+
+// Users tagged as high risk and their 2-hop neighborhood
+g.V().has('Tag', 'tagKey', 'RISK:HIGH').
+  in('TAGGED_WITH').hasLabel('User').as('risky').
+  repeat(both('FRIEND_OF','FOLLOWS')).times(2).
+  dedup().
+  path().
+  by(valueMap(true))
+
+
+
+// Top 10 users by number of followers
+g.V().hasLabel('User').
+  project('userId','followers').
+    by('userId').
+    by(in('FOLLOWS').count()).
+  order().by('followers', decr).
+  limit(10)
+
+
+
+// Users sharing the same device (possible account sharing / mule behavior)
+g.V().hasLabel('Device').as('d').
+  in('USES_DEVICE').group().
+    by('deviceId').
+    by(values('userId').fold())
+

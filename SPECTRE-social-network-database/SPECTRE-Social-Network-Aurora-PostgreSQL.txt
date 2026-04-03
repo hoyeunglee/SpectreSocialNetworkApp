@@ -1,0 +1,162 @@
+-- ---------- Core users & auth ----------
+
+CREATE TABLE users (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         VARCHAR(64) UNIQUE NOT NULL,   -- maps to Neptune User.user_id
+    email           CITEXT UNIQUE NOT NULL,
+    email_verified  BOOLEAN NOT NULL DEFAULT FALSE,
+    phone_e164      VARCHAR(32),
+    phone_verified  BOOLEAN NOT NULL DEFAULT FALSE,
+    password_hash   TEXT NOT NULL,
+    status          VARCHAR(32) NOT NULL DEFAULT 'ACTIVE',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_users_status ON users(status);
+
+CREATE TABLE user_profile (
+    user_id         BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    display_name    VARCHAR(128),
+    given_name      VARCHAR(128),
+    family_name     VARCHAR(128),
+    locale          VARCHAR(16),
+    timezone        VARCHAR(64),
+    birthdate       DATE,
+    -- minimal PII; more sensitive docs go to a separate KYC store
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ---------- Country & residency ----------
+
+CREATE TABLE countries (
+    country_code        CHAR(2) PRIMARY KEY,
+    name                VARCHAR(128) NOT NULL,
+    region              VARCHAR(32) NOT NULL,
+    data_residency_policy VARCHAR(64) NOT NULL
+);
+
+INSERT INTO countries (country_code, name, region, data_residency_policy) VALUES
+('US','United States','NA','DATA_RESIDENCY_US'),
+('DE','Germany','EU','DATA_RESIDENCY_EU_STRICT'),
+('HK','Hong Kong','APAC','DATA_RESIDENCY_HK');
+
+-- ---------- KYC & compliance ----------
+
+CREATE TABLE kyc_records (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kyc_level       VARCHAR(16) NOT NULL,  -- NONE/BASIC/FULL
+    provider        VARCHAR(64) NOT NULL,  -- e.g. 'ONFIDO'
+    status          VARCHAR(32) NOT NULL,  -- PENDING/APPROVED/REJECTED
+    reference_id    VARCHAR(128),         -- provider reference
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, provider)
+);
+
+CREATE INDEX idx_kyc_user ON kyc_records(user_id);
+CREATE INDEX idx_kyc_status ON kyc_records(status);
+
+-- ---------- Devices & sessions (relational view) ----------
+
+CREATE TABLE devices (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id_hash  VARCHAR(128) NOT NULL,
+    platform        VARCHAR(16) NOT NULL,  -- IOS/ANDROID
+    os_version      VARCHAR(32),
+    is_jailbroken   BOOLEAN,
+    is_rooted       BOOLEAN,
+    last_seen_at    TIMESTAMPTZ,
+    last_seen_ip    INET,
+    last_seen_country CHAR(2),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_devices_user ON devices(user_id);
+CREATE INDEX idx_devices_device_hash ON devices(device_id_hash);
+
+CREATE TABLE sessions (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id      VARCHAR(128) NOT NULL,
+    device_id       BIGINT REFERENCES devices(id) ON DELETE SET NULL,
+    ip_address      INET NOT NULL,
+    ip_hash         VARCHAR(128) NOT NULL,
+    asn             INTEGER,
+    connection_type VARCHAR(16),  -- MOBILE/WIFI/CORPORATE
+    country_code    CHAR(2),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ended_at        TIMESTAMPTZ,
+    UNIQUE (session_id)
+);
+
+CREATE INDEX idx_sessions_user ON sessions(user_id);
+CREATE INDEX idx_sessions_ip_hash ON sessions(ip_hash);
+
+-- ---------- Content (for non-graph queries) ----------
+
+CREATE TABLE content (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    content_id      VARCHAR(64) NOT NULL,  -- maps to Neptune Content.content_id
+    content_type    VARCHAR(16) NOT NULL,  -- POST/COMMENT/MESSAGE
+    visibility      VARCHAR(16) NOT NULL,  -- PUBLIC/FRIENDS/PRIVATE
+    body            TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (content_id)
+);
+
+CREATE INDEX idx_content_user ON content(user_id);
+CREATE INDEX idx_content_visibility ON content(visibility);
+
+-- ---------- Payments / ledger (simplified) ----------
+
+CREATE TABLE payment_methods (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider        VARCHAR(32) NOT NULL,  -- STRIPE, PAYPAL, etc.
+    external_id     VARCHAR(128) NOT NULL,
+    brand           VARCHAR(32),
+    last4           CHAR(4),
+    exp_month       SMALLINT,
+    exp_year        SMALLINT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (provider, external_id)
+);
+
+CREATE TABLE transactions (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    payment_method_id BIGINT REFERENCES payment_methods(id),
+    amount_cents    BIGINT NOT NULL,
+    currency        CHAR(3) NOT NULL,
+    status          VARCHAR(32) NOT NULL,  -- PENDING/SUCCEEDED/FAILED/REFUNDED
+    external_id     VARCHAR(128),         -- PSP transaction id
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_tx_user ON transactions(user_id);
+CREATE INDEX idx_tx_status ON transactions(status);
+
+-- ---------- Audit log (bank-style) ----------
+
+CREATE TABLE audit_log (
+    id              BIGSERIAL PRIMARY KEY,
+    user_id         BIGINT REFERENCES users(id) ON DELETE SET NULL,
+    actor_type      VARCHAR(32) NOT NULL,  -- USER/SYSTEM/ADMIN
+    actor_id        VARCHAR(128),         -- e.g. admin id or service name
+    action          VARCHAR(64) NOT NULL, -- e.g. 'LOGIN','KYC_APPROVED','FRIEND_REQUEST'
+    resource_type   VARCHAR(64) NOT NULL, -- 'USER','CONTENT','PAYMENT','GRAPH_EDGE'
+    resource_id     VARCHAR(128),
+    metadata        JSONB,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_user ON audit_log(user_id);
+CREATE INDEX idx_audit_action ON audit_log(action);
+CREATE INDEX idx_audit_resource ON audit_log(resource_type, resource_id);
